@@ -1,0 +1,927 @@
+---
+title: "Project 1: World Population"
+author: "CHU"
+output: word_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+# This first chunk is for setup. 
+# The 'include=FALSE' option means the code will run, but it won't be shown in the final document.
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Summary
+This project aims to conduct a focused data analysis on global population trends, utilizing datasets from the World Population Data and the World Bank Group. The core objective is to identify and visualize key demographic shifts, with a specific focus on population growth rates across different countries and regions.
+
+The analysis will address the following key questions:
+
+Population Growth Extremes: Identify countries with the most significant increases and decreases in population, both historically and over the last five years.
+
+Growth Rate Dynamics: Analyze the distribution of annual growth rates through histograms to highlight countries with the highest and lowest average rates, as well as those with the highest and lowest deviations.
+
+Regional and Economic Influences: Visualize and examine how population growth varies across different geographic regions and is influenced by a country's income group.
+
+## Data
+
+The data is available from the World Bank Group: https://data.worldbank.org/
+
+The data sets used in this project are downloaded from the following sources:
+
+- Total Population: https://data.worldbank.org/indicator/SP.POP.TOTL
+- Death rate: https://data.worldbank.org/indicator/SP.DYN.CDRT.IN
+- Birth rate: https://data.worldbank.org/indicator/SP.DYN.CBRT.IN
+- Population distribution: https://data.worldbank.org/indicator/SP.POP.1564.TO.ZS
+- Net Migration Data: https://data.worldbank.org/indicator/SM.POP.NETM
+
+```{r load-data, echo=FALSE}
+
+# Load Libraries and Data
+library(tidyverse)
+library(countrycode)
+library(flextable)
+library(gridExtra)
+library(ggExtra)
+
+# Create a Function to Wrangle the Data and Remove "X" in front of Years
+wrangle_data <- function(file_path, value_name) {
+  read.csv(file_path, skip = 4) %>%
+    pivot_longer(
+      cols = starts_with("X"),
+      names_to = "Year",
+      values_to = value_name,
+      values_drop_na = TRUE
+    ) %>%
+    mutate(Year = as.integer(gsub("X", "", Year))) %>%
+    select(Country.Name, Country.Code, Year, all_of(value_name))
+}
+
+wrangle_aux_data <- function(file_path, value_name) {
+  read_csv(file_path, skip = 4) %>%
+    pivot_longer(
+      cols = -c(`Country Name`, `Country Code`, `Indicator Name`, `Indicator Code`),
+      names_to = "Year",
+      values_to = value_name,
+      values_drop_na = TRUE
+    ) %>%
+    mutate(Year = as.integer(Year)) %>%
+   
+    select(
+      Country.Name = `Country Name`, 
+      Country.Code = `Country Code`, 
+      Year, 
+      all_of(value_name)
+    )
+}
+# Load and Wrangle All Datasets
+population_df <- wrangle_data("API_SP.POP.TOTL_DS2_en_csv_v2_23043.csv", "Population")
+birth_rate_df <- wrangle_data("API_SP.DYN.CBRT.IN_DS2_en_csv_v2_945.csv", "BirthRate")
+death_rate_df <- wrangle_data("API_SP.DYN.CDRT.IN_DS2_en_csv_v2_8003.csv", "DeathRate")
+
+migration_df <- wrangle_aux_data("API_SM.POP.NETM_DS2_en_csv_v2_97.csv", "Net_Migration")
+working_age_df <- wrangle_aux_data("API_SP.POP.1564.TO.ZS_DS2_en_csv_v2_154.csv", "Percent_15_64")
+
+country_meta <- read.csv("Metadata_Country_API_SP.POP.TOTL_DS2_en_csv_v2_23043.csv")
+
+# Valid ISO3 country codes
+valid_country_codes <- countrycode::codelist$iso3c %>% na.omit() %>% unique()
+```
+
+### Data Cleaning and Transformation
+
+The datasets was first tidied to transform it into a long format, making it easier to manage
+and visualize. The names of the columns were standardized for better clarity. Rows with any missing values were removed. Invalid country names removed using Valid ISO3 country codes (available in library 'countrycode').
+
+```{r merge data, echo=FALSE}
+
+# Merge All data sets and Compute rates
+data_merged <- population_df %>%
+  full_join(birth_rate_df, by = c("Country.Name", "Country.Code", "Year")) %>%
+  full_join(death_rate_df, by = c("Country.Name", "Country.Code", "Year")) %>%
+  full_join(migration_df, by = c("Country.Name", "Country.Code", "Year")) %>%
+  full_join(working_age_df, by = c("Country.Name", "Country.Code", "Year")) %>%
+  merge(country_meta %>% select(Country.Code, Region, IncomeGroup), by = "Country.Code") %>%
+  mutate(Net_Migration = as.numeric(Net_Migration)) %>%
+  mutate(Percent_15_64 = as.numeric(Percent_15_64)) %>%
+  # Reorder the Income Groups
+  mutate(IncomeGroup = factor(IncomeGroup,
+    levels = c("Low income", "Lower middle income", 
+    "Upper middle income", "High income") ) ) %>%
+  # Remove the rows with any missing values
+  filter(if_all(everything(), ~ !is.na(.))) %>%
+  # Remove the rows with empty Income Group
+  filter(IncomeGroup != "" & !is.na(IncomeGroup)) %>%
+  # Remove the rows with invalid county ISO3 codes
+  filter(Country.Code %in% valid_country_codes) %>%
+  arrange(Country.Name, Year)
+
+colnames(data_merged)[colnames(data_merged) == "Country.Code"] <- "Code"
+colnames(data_merged)[colnames(data_merged) == "Country.Name"] <- "Name"
+```
+
+### Preview the aggregated data sets
+
+```{r df preview, echo=FALSE}
+
+head(data_merged, 3) %>%
+  flextable() %>%
+  set_caption("World population (first 3 rows of merged datasets)") %>%
+  fontsize(size = 6, part = "all") 
+```
+
+```{r calc rates, echo=FALSE}
+
+# Calculate Growth Rate
+data_final <- data_merged %>%
+  group_by(Name) %>%
+  arrange(Name, Year) %>%
+  # Calculate Growth Rates
+  mutate(Lambda = Population/lag(Population)) %>%
+  #Calculate Instantaneous Rates
+  mutate(R = (BirthRate - DeathRate) / 1000) %>%
+  ungroup()
+
+# Remove the year 1960 to prevent NaNs in first row:
+data_final <- data_final[data_final$Year != 1960, ]
+
+# Check for duplicates
+# print(sum(duplicated(data_final['Code','Year'])))
+
+# write.csv(data_final, "data_final.csv")
+```
+
+## Part 1: EDA (Exploratory Data Analysis) of population growth:
+
+Population (annual) growth rate, $\lambda_t$, can be defined as the number of individuals in one year compared to the year before: 
+
+$$
+\lambda_t = \frac{N_{t}}{N_{t-1}},
+$$
+where  $N_t$ be the population at year $t$.
+
+If this rate of growth is constant over $t$ number of years and the initial population size is $N_o$, then the population size at year t is: $N_t=N_o \lambda^t$. This is the model of geometric population growth, i.e., a population growing in discrete time-steps with constant growth rate $\lambda$.
+
+
+```{r EDA rates, echo=FALSE, fig.width=8, fig.height=3.5}
+
+mean_growth <- mean(data_final$Lambda, na.rm = TRUE)
+min_growth <- min(data_final$Lambda, na.rm = TRUE)
+max_growth <- max(data_final$Lambda, na.rm = TRUE)
+
+# Summarize total population per year
+yearly_totals <- data_final %>%
+  group_by(Year) %>%
+  summarise(Total_Population = sum(Population, na.rm = TRUE))
+
+p1 <- ggplot(yearly_totals, aes(x = Year, y = Total_Population / 1e9)) +
+  geom_point(color = "steelblue", size = 1.5) +
+  ggtitle("Total Population") +
+  xlab("Year") +
+  ylab("Total Population (billions)") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(min(yearly_totals$Year), max(yearly_totals$Year), by = 10))
+
+
+# Display Distribution of Annual Growth Rates for all Countries, 1961-2024)
+p2 <- ggplot(data_final, aes(x = Lambda)) +
+  geom_histogram(binwidth = 0.02, fill = "steelblue",color = "black") +
+  # The vertical line to show the mean value
+  geom_vline(aes(xintercept = mean_growth), 
+             color = "red", linetype = "dashed", linewidth = 1) +
+  scale_x_continuous(limits = c(min_growth, max_growth)) +
+  labs(title = "Annual Growth Rates", x = "Growth Rate", y = "Frequency")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+Based on the Total Population plot, the world's population from 1960 to 2020 exhibited a tendency of continuous growth. The overall trend appears largely linear over this period, indicating a relatively constant rate of growth.
+
+The histogram of annual growth rates shows that most countries have growth rates above 1.0 (slightly right skewed) which indicates a positive growth overall. A few outliers on the right represent rapid growth, while a few on the left indicate decline.
+
+\pagebreak
+
+### Which countries have experienced the highest increase/decrease in population over time?
+
+```{r overall_increase, echo=FALSE, fig.width = 8}
+  
+growth_all_years <- data_final %>%
+  group_by(Name) %>%
+  summarise(mean_growth = mean(Lambda, na.rm = TRUE)) 
+
+# Top countries by total growth
+N_disp <- 9
+top_countries_all_years <- growth_all_years %>% arrange(desc(mean_growth)) %>% head(n=N_disp)
+
+# Top countries by total growth
+top_growth_countries <- top_countries_all_years$`Name`
+
+data_final %>%
+  filter(Name %in% top_growth_countries) %>%
+  ggplot(aes(x = Year, y = Population/ 1e6, color = Name)) +
+  geom_line(size = 0.8, show.legend = FALSE) +
+  facet_wrap(~ Name, scales = "free_y", ncol = 3) +
+  labs(title = "Countries with highest average increase in population over time", 
+       x = "Year", y = "Population (millions)") +
+  theme_minimal()
+```
+
+```{r overall_decrese, echo=FALSE, fig.width = 8}
+
+# Bottom countries by total growth
+tail_countries_all_years <- growth_all_years %>% arrange(mean_growth) %>% head(n=N_disp)
+
+# Bottom 10 countries by total growth
+tail_growth_countries <- tail_countries_all_years$`Name`
+
+data_final %>%
+  filter(Name %in% tail_growth_countries) %>%
+  ggplot(aes(x = Year, y = Population/ 1e6, color = Name)) +
+  geom_line(size = 0.8, show.legend = FALSE) +
+  facet_wrap(~ Name, scales = "free_y", ncol = 3) +
+  labs(title = "Countries with highest average decrease in population over time", 
+       x = "Year",
+       y = "Population (millions)") +
+  theme_minimal()
+```
+
+\pagebreak
+
+### Which countries have been experiencing the highest increase/decrease in population in the last five years?
+
+```{r recent-change, echo=FALSE}
+growth_last_five_years <- data_final %>%
+  filter(Year >= 2020 & Year <= 2024) %>%
+  group_by(Name) %>%
+  summarise(
+    Pop_2020 = first(Population[order(Year)]),
+    Pop_2024 = last(Population[order(Year)]),
+    Growth_Percent = (Pop_2024 - Pop_2020) / Pop_2020 * 100
+  )
+
+# Top countries by total growth
+top_countries_last_five_years <- growth_last_five_years %>% arrange(desc(Growth_Percent)) %>% head(n = N_disp)
+
+top_countries_last_five_years %>%
+  flextable() %>%
+  set_caption("Top Countries highest increase in population in last 5 years") %>%
+autofit()
+
+# Bottom countries by total growth
+tail_countries_last_five_years <- growth_last_five_years %>% arrange(Growth_Percent) %>% head(n = N_disp)
+
+tail_countries_last_five_years %>%
+  flextable() %>%
+  set_caption("Countries with highest decrease in population in last 5 years") %>%
+autofit()
+```
+
+### Histograms of annual growth rates with highest average rates.
+
+```{r P1Q3h, echo=FALSE, fig.width = 8, fig.height = 4}
+
+# Highest Average Rates
+top_countries_avg <- growth_all_years %>% arrange(desc(mean_growth)) %>% head(n=N_disp)
+
+#Plot
+ggplot(data_final %>% filter(Name %in% top_countries_avg$Name), aes(x = Lambda)) +
+  geom_histogram(binwidth = 0.02, fill = "steelblue", color = "black") +
+  scale_x_continuous(limits = c(min_growth, max_growth)) +
+  # The vertical line to show the mean population value
+  geom_vline(aes(xintercept = mean_growth), 
+             color = "red", linetype = "dashed", linewidth = 1) +
+  facet_wrap(~ Name, scales = "free_y", ncol = 3) +
+  labs(
+    # title = "Annual Growth Rates for Countries with Highest Average Rates",
+    x = "Annual Growth Rate", y = "Frequency"
+  )
+```
+
+### Histograms of annual growth rates with lowest average rates.
+
+```{r P1Q3L, echo=FALSE, fig.width = 8, fig.height = 4}
+
+# Lowest Average Rates
+tail_countries_avg <- growth_all_years  %>% arrange(mean_growth) %>% head(n=N_disp)
+
+#Plot
+ggplot(data_final %>% filter(Name %in% tail_countries_avg$Name), aes(x = Lambda)) +
+  geom_histogram(binwidth = 0.02, fill = "lightblue", color = "black") +
+  scale_x_continuous(limits = c(min_growth, max_growth)) +
+  # The vertical line to show the mean population value
+  geom_vline(aes(xintercept = mean_growth), 
+             color = "red", linetype = "dashed", linewidth = 1) +
+  facet_wrap(~ Name, scales = "free_y", ncol = 3) +
+  labs(
+    # title = "Annual Growth Rates for Countries with Lowest Average Rates",
+    x = "Annual Growth Rate", y = "Frequency"
+  )
+```
+
+### Population growth of countries over time grouped by region.
+
+```{r growth_plot, echo=FALSE, fig.width = 8, fig.height = 4}
+
+# Plot by Region
+
+# Calculate the total population for each region for each year
+regional_population <- data_final %>%
+  group_by(Region, Year) %>%
+  summarise(Total_Population = sum(Population, na.rm = TRUE), .groups = 'drop')
+
+ggplot(regional_population, aes(x = Year, y = Total_Population, color = Region)) +
+  geom_line(linewidth = 1.2) + 
+  
+  labs(
+    title = "Total Population Growth by Region",
+    x = "Year", 
+    y = "Total Regional Population",
+    color = "Region"
+  ) +
+  scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_si(""))) +
+  theme_minimal()
+```
+
+```{r P1Q4, echo=FALSE, fig.width = 8, fig.height = 3.5}
+
+# Calculate the average Growth rates for each region for each year
+
+regional_growth <- data_final %>%
+  group_by(Region, Year) %>%
+  summarise(mean_reg_rates = mean(Lambda, na.rm = TRUE), .groups = 'drop')
+
+
+ggplot(regional_growth, aes(x = Year, y = mean_reg_rates, color = Region)) +
+  geom_line(linewidth = 1.2) + 
+  labs(
+    title = "Average Growth Rate by Region",
+    x = "Year", 
+    y = "Population Growth Rate",
+    color = "Region"
+  ) +
+  theme_minimal()
+```
+
+```{r P1Q4_box_plot, echo=FALSE, fig.width = 8, fig.height = 4}
+
+ggplot(data_final, aes(x = Region, y = Lambda, fill = Region)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_y_continuous(limits = c(0.95, 1.075)) +
+  xlab("Region") +
+  ylab("Population Growth Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+### Population growth of countries over time grouped by income group.
+
+```{r P1Q5, echo=FALSE, fig.width = 8, fig.height = 4}
+
+# Plot by Income Group
+
+# Calculate the total population for each region for each year
+income_population <- data_final %>%
+  group_by(IncomeGroup, Year) %>%
+  summarise(Total_Population = sum(Population, na.rm = TRUE), .groups = 'drop')
+
+
+ggplot(income_population, aes(x = Year, y = Total_Population, color = IncomeGroup)) +
+  geom_line(linewidth = 1.2) + 
+  
+  labs(
+    title = "Total Population Growth by Income Group",
+    x = "Year", 
+    y = "Total Regional Population",
+    color = "IncomeGroup")  +
+  theme_minimal()
+```
+
+```{r P1Q5_rates, echo=FALSE, fig.width = 8, fig.height = 3.5}
+
+# Calculate the average Growth rates for each Income Group
+
+Inc_Gr_growth <- data_final %>%
+  group_by(IncomeGroup, Year) %>%
+  summarise(mean_Inc_rates = mean(Lambda, na.rm = TRUE), .groups = 'drop')
+
+
+ggplot(Inc_Gr_growth, aes(x = Year, y = mean_Inc_rates, color = IncomeGroup)) +
+  geom_line(linewidth = 1.2) + 
+  labs(
+    title = "Average Growth Rate by Income Group",
+    x = "Year", 
+    y = "Population Growth Rate",
+    color = "IncomeGroup"
+  ) +
+  theme_minimal()
+```
+
+```{r P1Q5_box_plot, echo=FALSE, fig.width = 8, fig.height = 4}
+
+ggplot(data_final, aes(x = IncomeGroup, y = Lambda, fill = IncomeGroup)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_y_continuous(limits = c(0.95, 1.075)) +
+  xlab("Income Group") +
+  ylab("Population Growth Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+## Part 2: Exponential population growth model
+
+Population growth is determined by the difference between the birth rate (number of births per 1,000 people) and the death rate (number of deaths per 1,000 people), a value known as the rate of natural increase.  When the birth rate is higher than the death rate, the population grows. When the death rate is higher, the population declines. 
+
+Exponential population growth occurs when a population is growing in continuous time with a constant growth rate, $r$: 
+
+$$
+N_t=N_o e^{rt},
+$$ 
+where $r$ is the instantaneous rate of growth which is the birth rate (births per individual) minus the death rate (deaths per individual) at any given time scale.
+
+Geometric and exponential growth models are very similar, except that they differ in several mathematical properties. But given a certain time unit, we can go between the two models easily by substituting $\lambda = e^r$ and $\ln(\lambda)=r$.
+
+Let $N_t$ be the population at year $t$, define the annual instantaneous rate for t years as 
+$\bar{r}$ that 
+
+$$ 
+{N_{t}} = N_{0} e^{\bar{r}t}. 
+$$
+
+Let the one-year instantaneous rate at year $t$ as $r_{t}$. We have 
+
+$$ 
+{N_{t}} = N_{t-1} e^{r_{t}}.
+$$ 
+$$ 
+\therefore r_{t} = \ln(\frac{N_{t}}{N_{t-1}}) 
+$$ 
+So, 
+
+$$ 
+\bar{r} = \frac{1}{t} \sum_{i=1}^{t} r_i = \frac{1}{t} \ln\left(\prod_{i=1}^{t} \frac{N_i}{N_{i-1}}\right)= \frac{1}{t} \ln\left(\frac{N_{t}}{N_{0}}\right). 
+$$ 
+That is, the annual instantaneous rate across multiple years is the mean of the one-year instantaneous rates. And the respective average annual growth rate should be computed as a geometric mean of the one-year growth rates: 
+
+$$
+\bar{\lambda} = \left({\frac{N_t}{N_0}} \right)^{\frac{1}{t}} = \left(\prod_{i=1}^{t} \frac{N_i}{N_{i-1}}\right)^{\frac{1}{t}} = \left(\prod_{i=1}^{t} \lambda_i \right)^{\frac{1}{t}}
+$$
+
+\pagebreak
+
+## EDA of Instantaneous Rates
+
+### Countries with highest instantaneous rate over time.
+
+```{r P2Q1h, echo=FALSE, fig.width = 8}
+  
+rates_all_years <- data_final %>%
+  group_by(Name) %>%
+  summarise(mean_inst_rates = mean(R, na.rm = TRUE))
+
+
+mean_R <- median(data_final$R, na.rm = TRUE)
+min_R <- min(data_final$R, na.rm = TRUE)
+max_R <- max(data_final$R, na.rm = TRUE)
+
+# Top countries by instantaneous rate
+
+top_countries_all_years <- rates_all_years %>% arrange(desc(mean_inst_rates)) %>% head(n=N_disp)
+
+# Top countries by total growth
+top_growth_countries <- top_countries_all_years$`Name`
+
+data_final %>%
+  filter(Name %in% top_growth_countries) %>%
+  ggplot(aes(x = Year, y = Population/ 1e6, color = Name)) +
+  geom_line(size = 0.8, show.legend = FALSE) +
+  facet_wrap(~ Name, scales = "free_y", ncol = 3) +
+  labs(title = "Countries with highest average instantaneous rate over time", 
+       x = "Year", y = "Population (millions)") +
+  theme_minimal()
+```
+
+### Countries with lowest instantaneous rate over time.
+
+```{r P2Q1L, echo=FALSE, fig.width = 8, fig.height = 4}
+
+# Top countries by instantaneous rate
+
+tail_countries_all_years <- rates_all_years %>% arrange(mean_inst_rates) %>% head(n=N_disp)
+
+# Top countries by total growth
+bottom_growth_countries <- tail_countries_all_years$`Name`
+
+data_final %>%
+  filter(Name %in% bottom_growth_countries) %>%
+  ggplot(aes(x = Year, y = Population/ 1e6, color = Name)) +
+  geom_line(size = 0.8, show.legend = FALSE) +
+  facet_wrap(~ Name, scales = "free_y", ncol = 3) +
+  labs(title = "Countries with lowest average instantaneous rate over time", 
+       x = "Year", y = "Population (millions)") +
+  theme_minimal()
+```
+
+\pagebreak
+
+### Which countries have been experiencing the highest/lowest instantaneous rate in the last five years?
+
+
+```{r P2Q2, echo=FALSE}
+
+rates_last_5 <- data_final %>%
+  filter(Year >= 2020 & Year <= 2024) %>%
+  group_by(Name) %>%
+  summarise(
+    Pop_2020 = first(Population[order(Year)]),
+    Pop_2024 = last(Population[order(Year)]),
+    mean_inst_rates = mean(R, na.rm = TRUE))
+  
+# Top countries by total growth
+top_countries_last_five_years <- rates_last_5 %>% arrange(desc(mean_inst_rates)) %>% head(n=N_disp)
+
+top_countries_last_five_years %>%
+  flextable() %>%
+  set_caption("Top Countries highest increase in population in last 5 years") %>%
+autofit()
+
+# Bottom countries by total growth
+tail_countries_last_five_years <- rates_last_5 %>% arrange(mean_inst_rates) %>% head(n=N_disp)
+
+tail_countries_last_five_years %>%
+  flextable() %>%
+  set_caption("Countries with highest decrease in population in last 5 years") %>%
+autofit()
+```
+
+\pagebreak
+
+### Histograms of instantaneous rates with highest average rates over time.
+
+```{r P2Q3h, echo=FALSE, fig.width = 8, fig.height = 4}
+
+# Highest Average Rates
+top_countries_avg <- rates_all_years %>% arrange(desc(mean_inst_rates)) %>% head(n=N_disp)
+
+#Plot
+ggplot(data_final %>% filter(Name %in% top_countries_avg$Name), aes(x = R)) +
+  geom_histogram(bins = 20, fill = "steelblue", color = "black") +
+  scale_x_continuous(limits = c(min_R, max_R)) +
+  # The vertical line to show the mean population value
+  geom_vline(aes(xintercept = mean_R), 
+             color = "red", linetype = "dashed", linewidth = 1) +
+  facet_wrap(~ Name, scales = "free_y", ncol = 3) +
+  labs(
+  #  title = "Annual Instantaneous Rates for Countries with Highest Average Rates",
+    x = "Annual Instantaneous Rate", y = "Frequency"
+  )
+```
+
+### Histograms of instantaneous rates with lowest average rates over time.
+
+```{r P2Q3L, echo=FALSE, fig.width = 8, fig.height = 4}
+
+# Highest Average Rates
+tail_countries_avg <- rates_all_years %>% arrange(mean_inst_rates) %>% head(n=N_disp)
+
+#Plot
+ggplot(data_final %>% filter(Name %in% tail_countries_avg$Name), aes(x = R)) +
+  geom_histogram(bins = 20, fill = "lightblue", color = "black") +
+  scale_x_continuous(limits = c(min_R, max_R)) +
+  # The vertical line to show the mean population value
+  geom_vline(aes(xintercept = mean_R), 
+             color = "red", linetype = "dashed", linewidth = 1) +
+  facet_wrap(~ Name, scales = "free_y", ncol = 3) +
+  labs(
+    # title = "Annual Instantaneous Rates for Countries with Lowest Average Rates",
+    x = "Annual Instantaneous Rate", y = "Frequency"
+  )
+```
+
+\pagebreak
+
+### Instantaneous rates of countries over time grouped by region.
+
+
+```{r P2Q4, echo=FALSE, fig.width = 8, fig.height = 4}
+
+# Plot by Region
+
+# Calculate the average Instantaneous rates for each region for each year
+regional_rates <- data_final %>%
+  group_by(Region, Year) %>%
+  summarise(mean_reg_rates = mean(R, na.rm = TRUE), .groups = 'drop')
+
+
+ggplot(regional_rates, aes(x = Year, y = mean_reg_rates, color = Region)) +
+  geom_line(linewidth = 1.2) + 
+  labs(
+    title = "Average Instantaneous rates per Region",
+    x = "Year", 
+    y = "Average Instantaneous Rate",
+    color = "Region"
+  ) +
+  theme_minimal()
+```
+
+
+```{r P2Q4_box_plot, echo=FALSE, fig.width = 8, fig.height = 4}
+
+ggplot(data_final, aes(x = Region, y = R, fill = Region)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_y_continuous(limits = c(-0.05, 0.05)) +
+  xlab("Region") +
+  ylab("Instant Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+### Instantaneous rates of countries by income group.
+
+```{r P2Q5_rtes, echo=FALSE, fig.width = 8, fig.height = 4}
+
+# Plot by Income Group
+
+# Calculate the average Instantaneous rates for each Income Group
+Inc_Gr_rates <- data_final %>%
+  group_by(IncomeGroup, Year) %>%
+  summarise(mean_Inc_rates = mean(R, na.rm = TRUE), .groups = 'drop')
+
+
+ggplot(Inc_Gr_rates, aes(x = Year, y = mean_Inc_rates, color = IncomeGroup)) +
+  geom_line(linewidth = 1.2) + 
+  labs(
+    title = "Average Instantaneous rates per Income Group",
+    x = "Year", 
+    y = "Average Instantaneous Rate",
+    color = "IncomeGroup"
+  ) +
+  theme_minimal()
+```
+
+```{r P2Q5_box_plot, echo=FALSE, fig.width = 8, fig.height = 4}
+
+ggplot(data_final, aes(x = IncomeGroup, y = R, fill = IncomeGroup)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_y_continuous(limits = c(-0.05, 0.05)) +
+  xlab("Income Group") +
+  ylab("Instantaneous Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+\pagebreak
+
+## Comparing the results in Parts 1 & 2
+
+```{r P1_P2, fig.width = 8}
+
+N_years <- yearly_totals$Year[length(yearly_totals)] - yearly_totals$Year[1]
+
+t <- yearly_totals$Year
+t <- t - t[1] + 1
+N_years <- length(t)
+P <- yearly_totals$Total_Population
+P0 <- P[1]
+PL <- P[N_years]
+geom_ave_growth <- (PL/P0)^(1/N_years)
+
+yearly_totals <- yearly_totals %>%
+  mutate(
+    pop_est1 = P0 * mean_growth^t,
+    pop_est2 = P0 * geom_ave_growth^t,
+    pop_est3 = P0 * (exp(mean_R))^t
+    )
+
+plot(yearly_totals$Year, yearly_totals$Total_Population / 1e9, col="steelblue",
+     xlab = "Year", ylab= "Total Population (billions)") 
+lines(yearly_totals$Year, yearly_totals$pop_est1 / 1e9, 
+       col = "blue")
+lines(yearly_totals$Year, yearly_totals$pop_est2 / 1e9, 
+       col = "darkgreen")
+lines(yearly_totals$Year, yearly_totals$pop_est3 / 1e9, 
+       col = "salmon")
+legend("topleft", legend = c("Original", "Arith mean", "Geom mean", "Exp"), col = c("steelblue", "blue", "darkgreen", "salmon"), pch = 19)
+grid()
+```
+
+```{r corr, echo=FALSE, fig.width = 8}
+
+# p1 <- ggplot(data_final, aes(x = R, y = log(Lambda)) ) +
+#  geom_point(color='blue') +
+#  labs(title = "Instantaneous Rate(r) and ln(Growth Rate λ)",
+#       x = "Instantaneous Rate (r)",
+#       y = "ln(Growth Rate λ)") +
+#  theme_minimal()
+
+# ggMarginal(p1, type = "histogram", fill = "skyblue", color = "darkblue")
+```
+
+```{r corr_ave, echo=FALSE, fig.width = 8, fig.height = 6}
+
+df_compare <- merge(rates_all_years, growth_all_years, by = "Name")
+
+p2 <- ggplot(df_compare, aes(x = mean_inst_rates, y = log(mean_growth)) ) +
+  geom_point(color='blue') +
+  labs(title = "Average Instantaneous Rate(r) and ln(Growth Rate λ)",
+       x = "Instantaneous Rate (r)",
+       y = "ln(Growth Rate λ)") +
+  theme_minimal()
+
+ggMarginal(p2, type = "histogram", fill = "skyblue", color = "darkblue")
+
+CR <- cor(df_compare$mean_inst_rates, log(df_compare$mean_growth))
+
+```
+
+The correlation coefficient is `r CR`, indicating that the average instantaneous rates $r$ and $\ln(\lambda)$ have a strong positive linear relationship. Some anomalies on the plot suggests that the formula is not perfect in some cases. Adding net migration into instantaneous rate may improve the formula. 
+
+\pagebreak
+
+## Other Factors influencing growth: Migration and Age Distribution
+
+### Age Distribution factor
+
+A population with a large proportion of young adults will likely have a high birth rate and experience natural increase, even with moderate fertility.
+
+```{r working_age_plots, echo=FALSE, fig.width = 8, fig.height = 4}
+
+# Plot by Income Group
+
+# Calculate the average Working Age distribution for each Income Group
+working_age_IG <- data_final %>%
+  group_by(IncomeGroup, Year) %>%
+  summarise(mean_working_age = mean(Percent_15_64, na.rm = TRUE), .groups = 'drop')
+
+
+ggplot(working_age_IG, aes(x = Year, y = mean_working_age, color = IncomeGroup)) +
+  geom_line(linewidth = 1.2) + 
+  labs(
+    title = "Population ages 15-64 (% of total) by Income Group",
+    x = "Year", 
+    y = "Population ages 15-64 (% of total)",
+    color = "IncomeGroup"
+  ) +
+  theme_minimal()
+```
+
+```{r working_age_box_plot, echo=FALSE, fig.width = 8}
+
+ggplot(data_final, aes(x = IncomeGroup, y = Percent_15_64, fill = IncomeGroup)) +
+  geom_boxplot(alpha = 0.7) +
+  xlab("Income Group") +
+  ylab("Population ages 15-64 (% of total)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+### Migration factor
+
+In addition to natural increase, population growth is also affected by immigration (people entering a population) and emigration (people leaving a population). 
+
+"Net migration" is the difference between the number of people entering a country or region (immigrants) and the number of people leaving (emigrants) over a specific period. A positive net migration indicates more people are entering than leaving, while a negative number means more people are emigrating. 
+
+```{r migration_plots, echo=FALSE, fig.width = 8, fig.height = 4}
+
+# Plot by Income Group
+
+# Calculate the average Working Age distribution for each Income Group
+migration_IG <- data_final %>%
+  group_by(IncomeGroup, Year) %>%
+  summarise(mean_migration= mean(Net_Migration, na.rm = TRUE), .groups = 'drop')
+
+
+ggplot(migration_IG, aes(x = Year, y = mean_migration, color = IncomeGroup)) +
+  geom_line(linewidth = 1.2) + 
+  labs(
+    title = "Net Migration by Income Group",
+    x = "Year", 
+    y = "Net Migration",
+    color = "IncomeGroup"
+  ) +
+  theme_minimal()
+```
+
+
+```{r migration_box_plot, echo=FALSE, fig.width = 8}
+
+ggplot(data_final, aes(x = IncomeGroup, y = Net_Migration, fill = IncomeGroup)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_y_continuous(limits = c(-10^4, 10^4)) +
+  xlab("Income Group") +
+  ylab("Net Migration") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+The net migration rate expresses this figure as a proportion per 1,000 people, using the formula following formula (https://en.wikipedia.org/wiki/Net_migration_rate): 
+
+Net Migration Rate = 1,000 * (Immigrants - Emigrants) / Mid-Year Population.
+
+```{r migration_rate, echo=FALSE}
+
+data_final <- data_final %>%
+  mutate(
+    Migration_Rate = (Net_Migration /Population),
+    R_v2 = R + Migration_Rate
+    )
+```
+
+```{r rate_migration_plots, echo=FALSE, fig.width = 8, fig.height = 4}
+
+# Plot by Income Group
+
+# Calculate the average Working Age distribution for each Income Group
+migration_rate_IG <- data_final %>%
+  group_by(IncomeGroup, Year) %>%
+  summarise(mean_migration_rate = mean(Migration_Rate, na.rm = TRUE), .groups = 'drop')
+
+
+ggplot(migration_rate_IG, aes(x = Year, y = mean_migration_rate, color = IncomeGroup)) +
+  geom_line(linewidth = 1.2) + 
+  labs(
+    title = "Net Migration Rate by Income Group",
+    x = "Year", 
+    y = "Net Migration Rate",
+    color = "IncomeGroup"
+  ) +
+  theme_minimal()
+```
+
+
+```{r rate_migration_box_plot, echo=FALSE, fig.width = 8}
+
+migration_box_plot <- ggplot(
+  data_final, aes(x = IncomeGroup, y = Migration_Rate, fill = IncomeGroup)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_y_continuous(limits = c(-0.02, 0.02)) +
+  xlab("Income Group") +
+  ylab("Net Migration Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+
+migration_box_plot
+
+```
+
+```{r corr_ave_v1, echo=FALSE, fig.width = 8, fig.height = 6}
+
+ggMarginal(p2, type = "histogram", fill = "skyblue", color = "darkblue")
+
+```
+
+```{r corr_ave_v2, echo=FALSE, fig.width = 8, fig.height = 6}
+
+rates_all_years <- data_final %>%
+  group_by(Name) %>%
+  summarise(mean_inst_rates = mean(R_v2, na.rm = TRUE))
+
+df_compare <- merge(rates_all_years, growth_all_years, by = "Name")
+
+p3 <- ggplot(df_compare, aes(x = mean_inst_rates, y = log(mean_growth)) ) +
+  geom_point(color='blue') +
+  labs(title = "Average Modified Instantaneous Rate (r_2) and ln(Growth Rate λ)",
+       x = "Instantaneous Rate (r_2)",
+       y = "ln(Growth Rate λ)") +
+  theme_minimal()
+
+ggMarginal(p3, type = "histogram", fill = "skyblue", color = "darkblue")
+
+CR_v2 <- cor(df_compare$mean_inst_rates, log(df_compare$mean_growth))
+
+```
+
+The correlation coefficient for originally defined Instantaneous growth rate, $r$ was `r CR`. Inclusion of the Net migration in the formula, the correlation coefficient has increased to `r CR_v2`.
+
+## Hypothesis testing
+
+The boxplot of Net Migtation per Income Group shows that the Net Migration (on average) is higher for High Income group then for all other Income Groups. We can use the Hypothesis Testing framework to statistically verify our visual observations.
+
+```{r, echo=FALSE, fig.width = 8}
+migration_box_plot
+```
+
+```{r hypothesis}
+
+High_Inc <- subset(data_final, IncomeGroup == "High income")
+Up_Mid_Inc <- subset(data_final, IncomeGroup == "Upper middle income")
+
+t.test(High_Inc$Migration_Rate, Up_Mid_Inc$Migration_Rate, alternative = "greater", var.equal = FALSE)
+```
+
+```{r av_migration_box_plot, echo=FALSE, fig.width = 8}
+
+ggplot(migration_rate_IG, aes(x = IncomeGroup, y = mean_migration_rate, fill = IncomeGroup)) +
+  geom_boxplot(alpha = 0.7) +
+  # scale_y_continuous(limits = c(-0.02, 0.02)) +
+  xlab("Income Group") +
+  ylab("Net Migration Rate (yearly avegare") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+```{r hypothesis_Av}
+
+High_Inc <- subset(migration_rate_IG, IncomeGroup == "High income")
+Up_Mid_Inc <- subset(migration_rate_IG, IncomeGroup == "Upper middle income")
+
+t.test(High_Inc$mean_migration_rate, Up_Mid_Inc$mean_migration_rate, alternative = "greater", var.equal = FALSE)
+```
