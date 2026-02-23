@@ -1,0 +1,646 @@
+---
+title: "Project_part2"
+author: "Chu Lin"
+date: "2025-11-23"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "C:/Users/clin0/OneDrive/Desktop/DSE Applied stastics/DataSets")
+```
+
+
+
+
+```{r}
+getwd()
+list.files()
+```
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(car)
+library(caret)
+library(mgcv)
+library(purrr)
+library(broom)
+library(rsample)
+library(leaps)
+library(glmnet)
+```
+
+
+```{r}
+mape <- function(actual, forecast) {
+  mean(abs((forecast - actual) / actual)) * 100
+}
+
+malpe <- function(actual, forecast) {
+  mean((forecast - actual) / actual) * 100
+}
+
+iqr_filter <- function(x, k = 1.5) {
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  
+  lower <- Q1 - k * IQR
+  upper <- Q3 + k * IQR
+  
+  return(x >= lower & x <= upper)
+}
+
+
+# Leverage filtering function
+leverage_filter <- function(model, df, threshold = NULL) {
+  h <- hatvalues(model)
+  
+  if (is.null(threshold)) {
+    p <- length(coef(model))          # number of coefficients
+    n <- nrow(df)                     # number of observations
+    threshold <- 2 * p / n
+  }
+  
+  keep <- h <= threshold
+  return(df[keep, ])
+}
+```
+
+
+```{r}
+df = read.csv("data_final.csv")
+head(df)
+```
+
+
+
+```{r}
+df <- df %>%
+  arrange(Code, Year) %>%             
+  group_by(Code) %>%
+  mutate(
+    r_t = round(log(lead(Population) / Population), 6)   
+  ) %>%
+  ungroup()
+
+df_v1 <- df %>% filter(!is.na(r_t))
+head(df_v1)
+
+```
+
+Convert the categorical:
+```{r}
+df_v1 <- df_v1 %>%
+  arrange(Code, Year) %>%             
+  group_by(Code) %>%
+  mutate(
+    IncomeGroup = as.factor(IncomeGroup),
+    Region = as.factor(Region),
+    pop_N_t = lag(Population) * exp(r_t)
+  )%>%
+  ungroup()
+
+ggplot(df_v1, aes(x = r_t)) +
+  geom_histogram(binwidth = 0.002, fill = "skyblue", color = "white") +
+  labs(title = "Histogram of r_t")
+```
+
+```{r}
+model_v1 <- lm(
+  r_t ~ BirthRate + DeathRate + Net_Migration + IncomeGroup + Region,
+  data = df_v1
+)
+
+summary(model_v1)
+
+```
+
+# Extended Linear model to v2 by timing categorical variables
+
+First, do EDA
+
+GAM
+```{r}
+plot(model_v1, which = 1)
+```
+
+which shows the mean value is near to 0, it means the linear model doesn't need to do polynomial
+
+
+QQ plot
+```{r}
+plot(model_v1, which=2)
+```
+
+QQ plot shows heavy tails
+
+
+
+
+Let's see the residual
+```{r}
+plot(model_v1, which=4)
+```
+
+
+
+```{r}
+car::residualPlots(model_v1)
+```
+
+Through to cook's distance and residuals plot, Seems like Death Rate and Net_migration have some outliers
+
+
+
+
+Evaluate if it needs Ridge or Lasso (L1/L2) to expand the model
+```{r}
+car::vif(model_v1)
+```
+So, we don't have to use L1 or L2
+
+
+
+
+After all the plots, here is the new models on different parameters
+
+## First method by manually change the parameters:
+```{r}
+# version 2 is: times the category
+model_v2 <- lm(r_t ~ BirthRate * Region +
+                       DeathRate * Region +
+                       Net_Migration * IncomeGroup +
+                      Region +
+                      IncomeGroup,
+                  data=df_v1)
+
+plot(model_v2)
+```
+
+
+```{r}
+anova(model_v1, model_v2)
+```
+it shows RSS reduce 0.096604, and P value smaller than .001, which means not bad
+
+
+```{r}
+model_v3 <- lm(
+  r_t ~ BirthRate +
+        DeathRate +
+        Net_Migration +
+        IncomeGroup + Region +
+        Net_Migration:IncomeGroup,
+  data = df_v1
+)
+
+plot(model_v3)
+anova(model_v2, model_v3)
+```
+Seems like model 2 is better than model 3 because of RSS, lets choose the version 2 one.
+
+
+
+
+
+## Second method by GAM (Just for better verify the models):
+
+```{r}
+gam_model <- gam(r_t ~ s(BirthRate, k=10) +
+                        s(DeathRate, k=10) +
+                        s(Net_Migration, k=10) +
+                        IncomeGroup +
+                        Region,
+                data=df_v1,
+                method="REML")
+
+summary(gam_model)
+plot(gam_model, pages=1, shade=TRUE)
+```
+
+
+
+
+After the plot, we can see Brith rate doesn't need to do GAM, so lets change it to version 2:
+
+```{r}
+gam_model_v2 <- gam(
+  r_t ~ BirthRate + 
+        s(DeathRate, k=10) +
+        s(Net_Migration, k=10) +
+        IncomeGroup +
+        Region,
+  data = df_v1,
+  method = "REML"
+)
+
+plot(gam_model_v2, pages=1, shade=TRUE)
+```
+
+ANOVA test:
+```{r}
+anova(model_v1, gam_model_v2)
+```
+
+
+```{r}
+anova(model_v2, gam_model_v2)
+```
+
+Through to ANOVA test, RSS reduce 0.14599. 
+The P value smaller than 0.001, which means significant
+
+Result: shows the GAM model is better than version 2 model
+
+
+
+
+# Subset selection
+
+Model_v2:
+$$
+r_t = \beta_0+\beta_1(BirthRate * Region) + \beta_2(DeathRate * Region) + \beta_3(Net_{Migration} * IncomeGroup) + \beta_4*Region + \beta_5*IncomeGroup+\epsilon_t
+$$
+
+
+```{r}
+reg_subset <- regsubsets(
+  r_t ~ BirthRate * Region + 
+    DeathRate * Region + 
+    Net_Migration * IncomeGroup+ 
+    IncomeGroup + Region,
+  data = df_v1,
+  nvmax = 27 
+)
+
+summary_reg <- summary(reg_subset)
+
+```
+
+
+```{r}
+names(summary_reg)
+
+summary_reg$rsq
+```
+
+
+```{r}
+par(mfrow = c(2,2))
+
+plot(summary_reg$rss,
+     xlab = "Number of variables",
+     ylab = "RSS",
+     type = "l")
+
+plot(summary_reg$adjr2,
+     xlab = "Number of Variables",
+     ylab = "Adjusted R-Squared",
+     type = "l")
+
+best_adjr2 <- which.max(summary_reg$adjr2)
+
+plot(summary_reg$adjr2,
+     xlab = "Number of Variables",
+     ylab = "Adjusted R-Squared",
+     type = "l")
+points(best_adjr2, summary_reg$adjr2[best_adjr2], col = "red", pch = 19)
+
+
+```
+
+```{r}
+par(mfrow = c(1,2))
+
+plot(summary_reg$cp,
+     xlab = "Number of Variables",
+     ylab = "Cp",
+     type = "l")
+
+best_cp <- which.min(summary_reg$cp)
+points(best_cp, summary_reg$cp[best_cp],
+       col = "red", cex = 2, pch = 20)
+
+best_cp
+
+plot(summary_reg$bic,
+     xlab = "Number of Variables",
+     ylab = "BIC",
+     type = "l")
+
+best_bic <- which.min(summary_reg$bic)
+points(best_bic, summary_reg$bic[best_bic],
+       col = "red", cex = 2, pch = 20)
+```
+So, the best number may select from 15 to 25
+
+
+Cross-Validation:
+  select the best number.
+```{r}
+predict_regsubset <- function(object, newdata, id) {
+  coefi <- coef(object, id = id)
+  vars <- names(coefi)
+  X <- model.matrix(
+    as.formula(object$call[[2]]),
+    newdata
+  )
+  return(X[, vars] %*% coefi)
+}
+
+set.seed(1)
+k <- 10
+folds <- sample(1:k, nrow(df_v1), replace = TRUE)
+
+cv_errors <- matrix(NA, k, 27)
+
+for (j in 1:k) {
+  train_data <- df_v1[folds != j, ]
+  test_data  <- df_v1[folds == j, ]
+
+  reg_k <- regsubsets(
+    r_t ~ BirthRate * Region + 
+      DeathRate * Region + 
+      Net_Migration * IncomeGroup +
+      IncomeGroup + Region,
+    data = train_data,
+    nvmax = 27
+  )
+
+  for (i in 1:27) {
+    pred <- predict_regsubset(reg_k, test_data, id = i)
+    cv_errors[j, i] <- mean((test_data$r_t - pred)^2)
+  }
+}
+
+mean_cv_errors <- apply(cv_errors, 2, mean)
+
+# Best model size selected by CV
+best_size <- which.min(mean_cv_errors)
+
+best_size <- which.min(summary_reg$bic)
+cat("Best size:", best_size, "\n")
+```
+
+The result shows below:
+
+```{r}
+final_model <- regsubsets(
+  r_t ~ BirthRate * Region + 
+    DeathRate * Region + 
+    Net_Migration * IncomeGroup +
+    IncomeGroup + Region,
+  data = df_v1,
+  nvmax = 16
+)
+
+coef(final_model, best_size)
+```
+After cross validation's plot:
+```{r}
+plot(mean_cv_errors, type = "b",
+     xlab = "Number of Variables",
+     ylab = "CV MSE",
+     main = "Cross Validation to Select Best Model (regsubsets)")
+abline(v = 16, col = "red", lwd = 2)
+```
+
+# Projected forecast
+
+First thought: predict instantaneous rate to calculate the Population rate.
+
+Predict r
+$$
+r_{t+h} = \beta_0+\beta_1BirthRate + \beta_2DeathRate + \beta_3Net_{Migration} + \beta_4Region + \beta_5IncomeGroup +\epsilon_t
+$$
+
+Through r to calculate N
+$$
+N_{t+h} = N_t*e^{r_{t+h}}
+$$
+
+1. base year: the year of the earliest population size used to make a forecast,
+2. launch year: the year of the latest population size used to make a forecast,
+3. target year: the year for which population size is forecast
+4. base period: the interval between the base year and launch year
+5. forecast horizon: the interval between the launch year and target year.
+
+
+
+
+# Rolling window Cross-validation and model 
+Thus, 1960 – 1980  → train
+1981 – 1981  → test when h=1
+1981 – 1985  → test when h=5
+1981 – 1990  → test when h=10
+
+
+```{r}
+model <- lm(
+  r_t ~ BirthRate + DeathRate + Net_Migration + IncomeGroup + Region,
+  data = df_v1
+)
+```
+
+
+Make functions for validations based on:
+$$
+\text{MAPE} = \frac{1}{n} \sum_{t=1}^{n} \left| PE_t \right|
+$$
+$$
+PE_t = \left( \frac{F_t - N_t}{N_t} \right) \times 100
+$$
+
+$$
+\text{MALPE} = \frac{1}{n} \sum_{t=1}^{n} PE_t
+$$
+
+
+
+because this model is based on cross-validation, so I want to build a function to easy train and test the model.
+
+```{r}
+# h to control the test data size.
+rolling_cross_validation <- function(df, h = 1, window_size = 20) {
+
+  years <- sort(unique(df$Year))
+  
+  # create a data frame to save the result
+  results <- data.frame()
+
+  for (start_year in years) {
+    
+    train_end <- start_year + window_size - 1
+    test_start <- train_end + 1
+    test_end   <- train_end + h
+    
+    # Auto break out from the loop if their no year inside the data
+    if (!(test_end %in% years)) next
+    
+    
+    train_block <- df[df$Year >= start_year & df$Year <= train_end, ]
+ 
+    test_block  <- df[df$Year >= test_start & df$Year <= test_end, ]
+
+    keep_idx <- iqr_filter(train_block$r_t, k = 1.5)
+    train_block_clean <- train_block[keep_idx, ]        
+    
+    model <- lm(
+      r_t ~ BirthRate + DeathRate + Net_Migration + IncomeGroup + Region,
+      data = train_block_clean
+    )
+    
+    model_best <- lm(
+      r_t ~ BirthRate + DeathRate + Net_Migration +
+             Region + IncomeGroup +
+             BirthRate:Region +
+             Region:DeathRate +
+             Net_Migration:IncomeGroup,
+      data = train_block_clean
+    )
+    
+    test_block$pred_r <- predict(model, newdata = test_block)
+    test_block$pred_r_best <- predict(model_best, newdata = test_block)
+    
+    test_block$pred_N <- test_block$Population * exp(test_block$pred_r)
+    test_block$pred_N_best <- test_block$Population * exp(test_block$pred_r_best)
+    
+    test_block$tb       <- start_year
+    test_block$tf       <- test_end
+    test_block$base_len <- window_size
+    test_block$horizon  <- h
+
+    results <- rbind(results, test_block)
+  }
+  
+  return(results)
+}
+```
+
+
+
+```{r}
+cv_h1_window10  <- rolling_cross_validation(df_v1, h = 1, window_size = 10)
+cv_h1_window20  <- rolling_cross_validation(df_v1, h = 1, window_size = 20)
+cv_h1_window30  <- rolling_cross_validation(df_v1, h = 1, window_size = 30)
+
+cv_h5_window10  <- rolling_cross_validation(df_v1, h = 5, window_size = 10)
+cv_h5_window20  <- rolling_cross_validation(df_v1, h = 5, window_size = 20)
+cv_h5_window30  <- rolling_cross_validation(df_v1, h = 5, window_size = 30)
+
+cv_h10_window10 <- rolling_cross_validation(df_v1, h = 10, window_size = 10)
+cv_h10_window20 <- rolling_cross_validation(df_v1, h = 10, window_size = 20)
+cv_h10_window30 <- rolling_cross_validation(df_v1, h = 10, window_size = 30)
+
+```
+
+```{r}
+cv_list <- list(
+  h1_w10  = cv_h1_window10,
+  h1_w20  = cv_h1_window20,
+  h1_w30  = cv_h1_window30,
+  
+  h5_w10  = cv_h5_window10,
+  h5_w20  = cv_h5_window20,
+  h5_w30  = cv_h5_window30,
+  
+  h10_w10 = cv_h10_window10,
+  h10_w20 = cv_h10_window20,
+  h10_w30 = cv_h10_window30
+)
+
+par(mfrow = c(3, 3), mar = c(4,4,2,1))
+
+for (name in names(cv_list)) {
+  
+  df <- cv_list[[name]]
+  
+  plot(df$r_t, df$pred_r,
+       pch = 16, col = "steelblue",
+       xlab = "True r_t",
+       ylab = "Predicted r_t",
+       main = name)
+  
+  abline(0, 1, lty = 2)
+}
+
+```
+`
+Function for validation:
+```{r}
+evaluate_cv <- function(cv_df) {
+  cv_df <- cv_df[!is.na(cv_df$pop_N_t) & !is.na(cv_df$pred_N), ]
+  
+  mape_validation  <- mape(cv_df$pop_N_t, cv_df$pred_N)
+  malpe_validation <- malpe(cv_df$pop_N_t, cv_df$pred_N)
+  
+  mape_validation_best  <- mape(cv_df$pop_N_t, cv_df$pred_N_best)
+  malpe_validation_best <- malpe(cv_df$pop_N_t, cv_df$pred_N_best) 
+  
+  data.frame(
+    MAPE  = mape_validation,
+    MALPE = malpe_validation,
+    MAPE_best = mape_validation_best,
+    MALPE_best = malpe_validation_best
+  )
+}
+```
+
+
+```{r}
+all_results <- rbind(
+  data.frame(Horizon = 1, Window = 10, evaluate_cv(cv_h1_window10)),
+  data.frame(Horizon = 1, Window = 20, evaluate_cv(cv_h1_window20)),
+  data.frame(Horizon = 1, Window = 30, evaluate_cv(cv_h1_window30)),
+  
+  data.frame(Horizon = 5, Window = 10, evaluate_cv(cv_h5_window10)),
+  data.frame(Horizon = 5, Window = 20, evaluate_cv(cv_h5_window20)),
+  data.frame(Horizon = 5, Window = 30, evaluate_cv(cv_h5_window30)),
+
+  data.frame(Horizon = 10, Window = 10, evaluate_cv(cv_h10_window10)),
+  data.frame(Horizon = 10, Window = 20, evaluate_cv(cv_h10_window20)),
+  data.frame(Horizon = 10, Window = 30, evaluate_cv(cv_h10_window30))
+)
+```
+
+
+
+Make a plot to show their results:
+```{r}
+final_table <- all_results %>%
+  pivot_wider(
+    names_from  = Window,
+    values_from = c(MAPE, MALPE),
+    names_sep   = "_W"
+  ) %>%
+  arrange(Horizon)
+
+print(final_table)
+```
+
+Look at this table, we can compare different window sizes and different horizon sizes.
+
+Window sizes (training data):
+which shows the model after subset is better than original model on the MAPE validation. whatever the window size is.
+
+Horizon sizes (forecast after h years data):
+I did not expect the result, the data after 10 years should hard to predict, but the table shows the model can predict the population after 10 years even better than 1 or 5 years.
+
+Conclusion:
+In this case by using 1, 5 and 10 as horizon sizes, and 10, 20 and 30 as train data sizes, the best prediction size is: 
+      horizon: 10
+      window:  30
+
+
+
+
+
+
+
+
+
+
